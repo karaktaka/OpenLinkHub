@@ -250,6 +250,8 @@ var (
 	cmdGetFirmware              = []byte{0x02, 0x13}
 	cmdSoftwareMode             = []byte{0x01, 0x03, 0x00, 0x02}
 	cmdHardwareMode             = []byte{0x01, 0x03, 0x00, 0x01}
+	cmdRefreshDevices           = []byte{0x1a, 0x01}
+	cmdWaitForDevice            = []byte{0x12, 0x00}
 	cmdWrite                    = []byte{0x06, 0x01}
 	cmdWriteColor               = []byte{0x06, 0x00}
 	cmdRead                     = []byte{0x08, 0x01}
@@ -429,6 +431,7 @@ func Init(vendorId, productId uint16, serial, path string) *common.Device {
 	d.getDeviceLcd()         // Check for LCDs
 	d.getDeviceFirmware()    // Firmware
 	d.setSoftwareMode()      // Activate software mode
+	d.wakeLinkChannels()     // Re-probe iCUE LINK channels (wakes pump after daemon restart)
 	d.getLedDeviceTypes()    // Device led types
 	d.getDevices()           // Get devices connected to a hub
 	d.getLedDevices()        // Get connected LED devices
@@ -4866,6 +4869,37 @@ func (d *Device) setSoftwareMode() {
 		logger.Log(logger.Fields{"error": err}).Error("Unable to change device mode")
 	}
 	time.Sleep(time.Duration(transferTimeout) * time.Millisecond)
+}
+
+// wakeLinkChannels asks the hub to re-probe its iCUE LINK channels and waits
+// for re-initialization to complete. Required after a software-driven daemon
+// restart (where the hub's USB power persists and its firmware retains state)
+// so AIO pump heads resume reporting RPM/temp without a hardware power cycle.
+//
+// No-op when config.RefreshOnStart is false. Caps polling at 20 iterations
+// (~10s) to bound startup latency in the unlikely event the hub never reports
+// readiness.
+func (d *Device) wakeLinkChannels() {
+	if !config.GetConfig().RefreshOnStart {
+		return
+	}
+	start := time.Now()
+	logger.Log(logger.Fields{"serial": d.Serial}).Info("Refreshing iCUE LINK channels")
+	_, _ = d.transfer(cmdRefreshDevices, nil, false)
+	for i := 0; i < 20; i++ {
+		time.Sleep(time.Duration(transferTimeout) * time.Millisecond)
+		res, _ := d.transfer(cmdWaitForDevice, nil, false)
+		if len(res) > 1 && res[1] == 0 {
+			time.Sleep(time.Duration(transferTimeout*2) * time.Millisecond)
+			logger.Log(logger.Fields{
+				"serial":     d.Serial,
+				"iterations": i + 1,
+				"elapsedMs":  time.Since(start).Milliseconds(),
+			}).Info("iCUE LINK channels ready")
+			return
+		}
+	}
+	logger.Log(logger.Fields{"serial": d.Serial}).Warn("iCUE LINK channels not ready after 10s; pump may not report")
 }
 
 // getLedDevices will get all connected LED data

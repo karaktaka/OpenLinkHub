@@ -28,6 +28,7 @@ type Configuration struct {
 	MemorySku                 string   `json:"memorySku"`
 	ConfigPath                string   `json:",omitempty"`
 	ResumeDelay               int      `json:"resumeDelay"`
+	RefreshOnStart            bool     `json:"refreshOnStart"`
 	LogFile                   string   `json:"logFile"`
 	LogLevel                  string   `json:"logLevel"`
 	EnhancementKits           []byte   `json:"enhancementKits"`
@@ -54,6 +55,7 @@ var (
 	upgrade       = map[string]any{
 		"memorySku":                 "",
 		"resumeDelay":               15000,
+		"refreshOnStart":            true,
 		"logLevel":                  "info",
 		"logFile":                   "",
 		"enhancementKits":           make([]byte, 0),
@@ -149,6 +151,7 @@ func upgradeFile(cfg string) {
 			Exclude:                   make([]uint16, 0),
 			MemorySku:                 "",
 			ResumeDelay:               15000,
+			RefreshOnStart:            true,
 			LogLevel:                  "info",
 			LogFile:                   "",
 			EnhancementKits:           make([]byte, 0),

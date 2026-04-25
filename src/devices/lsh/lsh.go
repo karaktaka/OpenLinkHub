@@ -226,6 +226,7 @@ type Device struct {
 	lcdTimer               *time.Ticker
 	mutex                  sync.Mutex
 	mutexLcd               sync.Mutex
+	lastReopenAttempt      time.Time // gate for transfer() stale-handle reopen recovery
 	deviceLock             sync.Mutex
 	lcdDevices             map[string]*LCD
 	LinkAdapter            []LinkAdapter
@@ -282,6 +283,7 @@ var (
 	headerWriteSize             = 4
 	bufferSizeWrite             = bufferSize + 1
 	transferTimeout             = 500
+	staleHandleReopenInterval   = 5 * time.Second // anti-thrash gate for transfer() reopen recovery
 	maxBufferSizePerRequest     = 508
 	defaultSpeedValue           = 70
 	temperaturePullingInterval  = 3000
@@ -5620,44 +5622,110 @@ func (d *Device) transferToLcd(buffer []byte, lcdDevice *hid.Device) {
 	}
 }
 
-// transfer will send data to a device and retrieve device output
+// isStaleHandleErr returns true when the given error indicates the underlying
+// hidraw fd is no longer talking to a live device (e.g. after a USB authorize
+// toggle, kernel-driven device reset, or hub re-enumeration). Matching is
+// case-insensitive substring against the strerror() output that go-hid surfaces
+// from the Linux hidraw backend (see hid_linux.c register_device_error paths).
+func isStaleHandleErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection timed out") || // ETIMEDOUT
+		strings.Contains(msg, "no such device") || // ENODEV
+		strings.Contains(msg, "device disconnected") // hidraw poll disconnect
+}
+
+// transfer locks the device mutex, runs the actual HID write/read via
+// transferLocked, and on a stale-handle error attempts a one-shot recovery
+// (close + reopen + software-mode handshake) before retrying the request once.
+// Errors are logged but not surfaced to callers, preserving the historical
+// "always returns (buf, nil)" contract that the rest of the package relies on.
+//
+// The reopen path is gated by staleHandleReopenInterval so a wedged hub does
+// not produce a tight reopen-fail loop during the auto-refresh ticker.
 func (d *Device) transfer(endpoint, buffer []byte, psu bool) ([]byte, error) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	bufferR := make([]byte, bufferSize)
-	if d.Exit {
-		bufferW := make([]byte, bufferSizeWrite)
-		bufferW[2] = 0x01
-		endpointHeaderPosition := bufferW[headerSize : headerSize+len(endpoint)]
-		copy(endpointHeaderPosition, endpoint)
-		if len(buffer) > 0 {
-			copy(bufferW[headerSize+len(endpoint):headerSize+len(endpoint)+len(buffer)], buffer)
-		}
-		if _, err := d.dev.Write(bufferW); err != nil {
-			logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to write to a device")
-		}
-	} else {
-		bufferW := make([]byte, bufferSizeWrite)
-		if psu {
-			bufferW[1] = psuInitHeader
-		}
-		bufferW[2] = 0x01
-		endpointHeaderPosition := bufferW[headerSize : headerSize+len(endpoint)]
-		copy(endpointHeaderPosition, endpoint)
-		if len(buffer) > 0 {
-			copy(bufferW[headerSize+len(endpoint):headerSize+len(endpoint)+len(buffer)], buffer)
-		}
-
-		if _, err := d.dev.Write(bufferW); err != nil {
-			logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to write to a device")
-		}
-
-		if _, err := d.dev.Read(bufferR); err != nil {
-			logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to read data from device")
+	bufferR, err := d.transferLocked(endpoint, buffer, psu)
+	if err != nil && !d.Exit && isStaleHandleErr(err) {
+		if time.Since(d.lastReopenAttempt) >= staleHandleReopenInterval {
+			d.lastReopenAttempt = time.Now()
+			if reopenErr := d.reopenLocked(); reopenErr != nil {
+				logger.Log(logger.Fields{"error": reopenErr, "serial": d.Serial}).Error("Reopen failed; hub may need power cycle")
+			} else {
+				bufferR, err = d.transferLocked(endpoint, buffer, psu)
+			}
 		}
 	}
+	if err != nil {
+		logger.Log(logger.Fields{"error": err, "serial": d.Serial}).Error("Unable to communicate with device")
+	}
 	return bufferR, nil
+}
+
+// transferLocked is the inner body of transfer. The caller must hold d.mutex.
+// It performs the HID write (always) and read (only when not in d.Exit), and
+// returns the first Write or Read error encountered so the caller can decide
+// whether to attempt recovery.
+func (d *Device) transferLocked(endpoint, buffer []byte, psu bool) ([]byte, error) {
+	bufferR := make([]byte, bufferSize)
+	bufferW := make([]byte, bufferSizeWrite)
+	if !d.Exit && psu {
+		bufferW[1] = psuInitHeader
+	}
+	bufferW[2] = 0x01
+	endpointHeaderPosition := bufferW[headerSize : headerSize+len(endpoint)]
+	copy(endpointHeaderPosition, endpoint)
+	if len(buffer) > 0 {
+		copy(bufferW[headerSize+len(endpoint):headerSize+len(endpoint)+len(buffer)], buffer)
+	}
+
+	if _, err := d.dev.Write(bufferW); err != nil {
+		return bufferR, err
+	}
+	if d.Exit {
+		return bufferR, nil
+	}
+	if _, err := d.dev.Read(bufferR); err != nil {
+		return bufferR, err
+	}
+	return bufferR, nil
+}
+
+// reopenLocked opens a fresh hidraw handle for the same VID/PID/serial and,
+// on success, closes and replaces the previous one. The caller must hold
+// d.mutex. After a successful open the software-mode handshake is re-sent
+// because authorize-toggle and kernel resets can flip the hub back to
+// hardware mode. The caller is responsible for retrying the failed transfer
+// after this returns nil.
+//
+// The open-before-close order is deliberate: if hid.Open fails (e.g. the
+// device hasn't re-enumerated yet), d.dev is left pointing at the existing
+// (broken) handle so that subsequent transferLocked calls return errors
+// rather than nil-dereferencing on Write/Read. Those errors then re-trigger
+// this reopen path under the staleHandleReopenInterval gate.
+func (d *Device) reopenLocked() error {
+	newDev, err := hid.Open(d.VendorId, d.ProductId, d.Serial)
+	if err != nil {
+		return err
+	}
+	if d.dev != nil {
+		if closeErr := d.dev.Close(); closeErr != nil {
+			logger.Log(logger.Fields{"error": closeErr, "serial": d.Serial}).Warn("Close failed during reopen; continuing")
+		}
+	}
+	d.dev = newDev
+	// Re-arm software mode. We use transferLocked directly to avoid
+	// re-acquiring d.mutex, which the caller already holds.
+	if _, swErr := d.transferLocked(cmdSoftwareMode, nil, false); swErr != nil {
+		logger.Log(logger.Fields{"error": swErr, "serial": d.Serial}).Warn("Software-mode handshake after reopen failed")
+	}
+	time.Sleep(time.Duration(transferTimeout) * time.Millisecond)
+	logger.Log(logger.Fields{"serial": d.Serial}).Info("hidraw handle reopened")
+	return nil
 }
 
 // responseMatch will check if two byte arrays match

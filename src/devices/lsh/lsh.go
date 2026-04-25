@@ -436,8 +436,22 @@ func Init(vendorId, productId uint16, serial, path string) *common.Device {
 	d.setDeviceProtection()  // Protect device
 	d.setDefaults()          // Set default speed and color values for fans and pumps
 	d.setAutoRefresh()       // Set auto device refresh
-	d.saveDeviceProfile()    // Save profile
-	d.setupLedProfile()      // LED profile
+	// Guard: refuse to rewrite the saved profile when the hub returned no
+	// channels. Almost always a transient enumeration failure (re-enumeration,
+	// USB authorize toggle, software-mode handshake race) rather than the
+	// user removing every device. Without this check, saveDeviceProfile
+	// would persist empty maps for every per-channel field, destroying the
+	// saved configuration.
+	if d.DeviceProfile != nil && len(d.Devices) == 0 {
+		logger.Log(logger.Fields{
+			"serial":  d.Serial,
+			"product": d.Product,
+			"saved":   len(d.DeviceProfile.SpeedProfiles),
+		}).Warn("Hub returned no channels at startup; preserving saved profile and skipping LED profile rebuild")
+	} else {
+		d.saveDeviceProfile() // Save profile
+		d.setupLedProfile()   // LED profile
+	}
 	d.getTemperatureProbe()  // Devices with temperature probes
 	d.pumpInnerLedPosition() // Pump inner LEDs
 	if config.GetConfig().Manual {
@@ -504,7 +518,7 @@ func (d *Device) setupLedProfile() {
 	profileLength := len(d.ledProfile.Devices)
 	actualLength := len(d.Devices)
 	if profileLength != actualLength {
-		logger.Log(logger.Fields{"serial": d.Serial, "product": d.Product, "profile": profileLength, "actual": actualLength}).Info("Device amount changed. LED profile will be re-created.")
+		logger.Log(logger.Fields{"serial": d.Serial, "product": d.Product, "profile": profileLength, "actual": actualLength}).Warn("LED profile channel count differs from live device set; merging without dropping saved channels")
 		d.saveLedProfile()
 		d.ledProfile = led.LoadProfile(d.Serial)
 	}
@@ -519,23 +533,28 @@ func (d *Device) saveLedProfile() {
 		return
 	}
 
-	// Init
-	lightChannels := 0
-	keys := make([]int, 0)
+	// Seed devices from the current on-disk LED profile so transient
+	// missing channels keep their saved LED data. The loop below
+	// regenerates only entries that are missing or whose LedChannels
+	// count has actually changed.
+	devices := map[int]led.DeviceData{}
+	if d.ledProfile != nil {
+		for k, v := range d.ledProfile.Devices {
+			devices[k] = v
+		}
+	}
+
+	keys := make([]int, 0, len(d.Devices))
 	for k := range d.Devices {
-		lightChannels += int(d.Devices[k].LedChannels)
 		keys = append(keys, k)
 	}
 	sort.Ints(keys)
 
-	device := led.Device{
-		Serial:     d.Serial,
-		DeviceName: d.Product,
-	}
-
-	devices := map[int]led.DeviceData{}
-
 	for _, k := range keys {
+		if existing, found := devices[k]; found && existing.LedChannels == d.Devices[k].LedChannels {
+			continue
+		}
+
 		channels := map[int]rgb.Color{}
 		deviceData := led.DeviceData{}
 		deviceData.LedChannels = d.Devices[k].LedChannels
@@ -573,7 +592,12 @@ func (d *Device) saveLedProfile() {
 		deviceData.Channels = channels
 		devices[k] = deviceData
 	}
-	device.Devices = devices
+
+	device := led.Device{
+		Serial:     d.Serial,
+		DeviceName: d.Product,
+		Devices:    devices,
+	}
 	led.SaveProfile(d.Serial, device)
 }
 
@@ -1054,6 +1078,31 @@ func (d *Device) saveDeviceProfile() {
 	rgbProbes := make(map[int]int, len(d.Devices))
 	minTemps := make(map[int]float64, len(d.Devices))
 	maxTemps := make(map[int]float64, len(d.Devices))
+
+	// Seed per-channel maps from the saved profile so channels not present
+	// in d.Devices right now (transient enumeration gaps, partially-failed
+	// reads) keep their saved values. The loop below overlays current
+	// values for channels that ARE present.
+	if d.DeviceProfile != nil {
+		for k, v := range d.DeviceProfile.SpeedProfiles {
+			speedProfiles[k] = v
+		}
+		for k, v := range d.DeviceProfile.RGBProfiles {
+			rgbProfiles[k] = v
+		}
+		for k, v := range d.DeviceProfile.Labels {
+			labels[k] = v
+		}
+		for k, v := range d.DeviceProfile.RGBProbes {
+			rgbProbes[k] = v
+		}
+		for k, v := range d.DeviceProfile.MinTemps {
+			minTemps[k] = v
+		}
+		for k, v := range d.DeviceProfile.MaxTemps {
+			maxTemps[k] = v
+		}
+	}
 
 	var positions []string
 

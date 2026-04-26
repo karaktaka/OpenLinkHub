@@ -676,7 +676,13 @@ func (d *Device) Stop() {
 		}
 	}
 
-	d.setHardwareMode()
+	// Deliberately do NOT call setHardwareMode() here: the hub firmware
+	// auto-transitions to hardware mode after ~10s of USB idle. Sending
+	// cmdHardwareMode explicitly puts the firmware in a state where the
+	// next daemon's setSoftwareMode + cmdRefreshDevices cycle returns
+	// garbage channel enumeration data, leaving the daemon wedged with
+	// d.Devices empty until manually killed (kill -9). Letting the
+	// firmware handle the transition on its own works cleanly.
 	if d.dev != nil {
 		err := d.dev.Close()
 		if err != nil {
